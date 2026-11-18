@@ -1,0 +1,16 @@
+# SBID local configuration - contains secrets
+app/config.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+.env.*
+
+# SQLite runtime files
+*.db-journal
+*.db-shm
+*.db-wal

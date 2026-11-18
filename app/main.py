@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 import secrets
 import sqlite3
+from app.config import ADMIN_API_KEY
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -24,6 +25,8 @@ class RegisterRequest(BaseModel):
 class ValidateRequest(BaseModel):
     token: str = Field(min_length=1)
 
+class HeartbeatRequest(BaseModel):
+    token: str
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(
@@ -79,13 +82,20 @@ def init_db() -> None:
             )
 
         if "app_version" not in columns:
-            connection.execute(
+                connection.execute(
                 """
                 ALTER TABLE devices
                 ADD COLUMN app_version TEXT
                 """
-            )
+             )
 
+        if "last_seen" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE devices
+                ADD COLUMN last_seen DATETIME
+                """
+            )
         if "token" in columns:
             old_tokens = connection.execute(
                 """
@@ -232,7 +242,8 @@ def validate(request: ValidateRequest):
             """
             SELECT
                 id,
-                android_id
+                android_id,
+                enabled
             FROM devices
             WHERE token_hash = ?
             """,
@@ -240,6 +251,13 @@ def validate(request: ValidateRequest):
         ).fetchone()
 
     if device:
+
+        if device["enabled"] != 1:
+            return {
+                "valid": False,
+                "reason": "disabled"
+            }
+
         return {
             "valid": True,
             "device_id": device["id"],
@@ -250,8 +268,50 @@ def validate(request: ValidateRequest):
         "valid": False
     }
 
+@app.post("/api/v1/heartbeat")
+def heartbeat(request: HeartbeatRequest):
 
-@app.get("/devices")
+    print("Heartbeat received")
+
+    submitted_token_hash = hash_token(
+        request.token
+    )
+
+    with get_database_connection() as connection:
+
+        device = connection.execute(
+            """
+            SELECT id
+            FROM devices
+            WHERE token_hash = ?
+            """,
+            (submitted_token_hash,)
+        ).fetchone()
+
+        if not device:
+
+            return {
+                "success": False,
+                "message": "Invalid token"
+            }
+
+        connection.execute(
+            """
+            UPDATE devices
+            SET last_seen = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (device["id"],)
+        )
+
+        connection.commit()
+
+    return {
+        "success": True,
+        "device_id": device["id"]
+    }
+
+@app.get("/api/v1/devices")
 def devices():
     with get_database_connection() as connection:
         rows = connection.execute(
@@ -261,7 +321,9 @@ def devices():
                 android_id,
                 device_name,
                 app_version,
-                created
+                enabled,
+                created,
+                last_seen
             FROM devices
             ORDER BY id
             """
@@ -273,7 +335,126 @@ def devices():
             "android_id": row["android_id"],
             "device_name": row["device_name"],
             "app_version": row["app_version"],
-            "created": row["created"]
+            "enabled": row["enabled"],
+            "created": row["created"],
+            "last_seen": row["last_seen"]
         }
         for row in rows
     ]
+@app.post("/api/v1/device/{device_id}/disable")
+def disable_device(device_id: int):
+
+    with get_database_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE devices
+            SET enabled = 0
+            WHERE id = ?
+            """,
+            (device_id,)
+        )
+
+        connection.commit()
+
+    if cursor.rowcount == 0:
+        return {
+            "success": False,
+            "message": "Device not found"
+        }
+
+    return {
+        "success": True,
+        "device_id": device_id,
+        "enabled": False
+    }
+
+@app.post("/api/v1/device/{device_id}/enable")
+def enable_device(device_id: int):
+    with get_database_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE devices
+            SET enabled = 1
+            WHERE id = ?
+            """,
+            (device_id,)
+        )
+        connection.commit()
+
+    if cursor.rowcount == 0:
+        return {
+            "success": False,
+            "message": "Device not found"
+        }
+
+    return {
+        "success": True,
+        "device_id": device_id,
+        "enabled": True
+    }
+
+@app.get("/api/v1/device/{device_id}")
+def get_device(device_id: int):
+    with get_database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id, device_name, enabled, last_seen
+            FROM devices
+            WHERE id = ?
+            """,
+            (device_id,)
+        ).fetchone()
+
+    if row is None:
+        return {"success": False}
+
+    return dict(row)
+
+@app.delete("/api/v1/device/{device_id}")
+def delete_device(device_id: int):
+    with get_database_connection() as connection:
+        cursor = connection.execute(
+            """
+            DELETE FROM devices
+            WHERE id = ?
+            """,
+            (device_id,)
+        )
+        connection.commit()
+
+    if cursor.rowcount == 0:
+        return {
+            "success": False,
+            "message": "Device not found"
+        }
+
+    return {
+        "success": True,
+        "device_id": device_id
+    }
+
+@app.get("/api/v1/stats")
+def stats():
+    with get_database_connection() as connection:
+
+        total = connection.execute(
+            "SELECT COUNT(*) FROM devices"
+        ).fetchone()[0]
+
+        enabled = connection.execute(
+            "SELECT COUNT(*) FROM devices WHERE enabled = 1"
+        ).fetchone()[0]
+
+        active = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM devices
+            WHERE last_seen >= datetime('now', '-1 day')
+            """
+        ).fetchone()[0]
+
+    return {
+        "total_devices": total,
+        "enabled_devices": enabled,
+        "active_last_24h": active
+    }
